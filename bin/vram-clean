@@ -1,0 +1,193 @@
+#!/bin/bash
+# Free VRAM by closing the applications that hold it.
+#
+# On NVIDIA a process's memory is only released when that process exits: there
+# is no GPU equivalent of drop_caches, and --gpu-reset needs an idle GPU, which
+# it never is while Hyprland runs on it. So this lists the big consumers and
+# closes the ones you pick.
+#
+# The compositor, the shell and the terminals also show up in the list; killing
+# them would break the session. They are filtered out (see PROTECTED_RE) and
+# never offered.
+#
+# Usage:
+#   vram-clean           List candidates and ask what to close
+#   vram-clean --list    Show the state, kill nothing
+#   vram-clean --yes     Close every candidate without asking
+#   vram-clean --pause   Like the default, then wait for a key before exiting
+#   vram-clean --help    This help
+
+set -uo pipefail
+
+# Never offered: the session depends on them.
+PROTECTED_RE='^(Hyprland|quickshell|qs|Xwayland|xdg-desktop-portal.*|foot|alacritty|ghostty|kitty|systemd.*)$'
+
+err() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+info() { printf '\033[36m%s\033[0m\n' "$*"; }
+ok() { printf '\033[32m%s\033[0m\n' "$*"; }
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \?//'; }
+
+MODE=ask
+PAUSE=0
+case "${1:-}" in
+  --help | -h)
+    usage
+    exit 0
+    ;;
+  --list | -l) MODE=list ;;
+  --yes | -y) MODE=yes ;;
+  --pause) PAUSE=1 ;;
+  "") ;;
+  *)
+    err "Unknown option: $1"
+    usage
+    exit 1
+    ;;
+esac
+
+# Launched from the bar, the terminal closes as soon as the script exits: keep
+# the result on screen until a key is pressed.
+finish() {
+  if ((PAUSE)); then
+    echo
+    read -n1 -rsp 'Press any key…'
+  fi
+}
+trap finish EXIT
+
+command -v nvidia-smi >/dev/null || {
+  err "nvidia-smi not found — no NVIDIA GPU?"
+  exit 1
+}
+
+# --- overall VRAM state ------------------------------------------------------
+read -r USED TOTAL < <(
+  nvidia-smi --query-gpu=memory.used,memory.total \
+    --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ','
+)
+[[ -n ${USED:-} && -n ${TOTAL:-} ]] || {
+  err "Could not read VRAM usage."
+  exit 1
+}
+PCT=$((USED * 100 / TOTAL))
+
+info "VRAM: ${USED} / ${TOTAL} MiB (${PCT}%)"
+echo
+
+# --- process inventory -------------------------------------------------------
+# --query-compute-apps only sees compute contexts and misses purely graphical
+# processes (Hyprland, quickshell, terminals). So the default table is parsed,
+# and each PID resolved with ps: nvidia-smi truncates long Electron command
+# lines and hides the real name.
+mapfile -t ROWS < <(
+  nvidia-smi 2>/dev/null |
+    awk '/^\|[[:space:]]+[0-9]+[[:space:]]+N\/A/ {
+           mem = ""
+           for (i = 1; i <= NF; i++) if ($i ~ /MiB$/) mem = $i
+           gsub(/MiB/, "", mem)
+           if (mem != "") print $5, mem
+         }'
+)
+
+((${#ROWS[@]})) || {
+  err "No GPU process found."
+  exit 1
+}
+
+CAND_LABELS=()
+PROTECTED_LINES=()
+
+for row in "${ROWS[@]}"; do
+  pid=${row%% *}
+  mem=${row##* }
+  name=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')
+  [[ -n $name ]] || continue
+
+  line=$(printf '%-22s %6s MiB  (pid %s)' "$name" "$mem" "$pid")
+  if [[ $name =~ $PROTECTED_RE ]]; then
+    PROTECTED_LINES+=("$line")
+  else
+    # Sort key in front, stripped after sorting.
+    CAND_LABELS+=("$(printf '%09d|%s' "$mem" "$line")")
+  fi
+done
+
+if ((${#PROTECTED_LINES[@]})); then
+  echo "Protected (never closed):"
+  printf '  %s\n' "${PROTECTED_LINES[@]}"
+  echo
+fi
+
+((${#CAND_LABELS[@]})) || {
+  ok "Nothing to close — the remaining VRAM is used by the session itself."
+  exit 0
+}
+
+mapfile -t SORTED < <(printf '%s\n' "${CAND_LABELS[@]}" | sort -rn -t'|' -k1)
+
+echo "Candidates:"
+for entry in "${SORTED[@]}"; do
+  printf '  %s\n' "${entry#*|}"
+done
+echo
+
+[[ $MODE == list ]] && exit 0
+
+# --- selection ---------------------------------------------------------------
+CHOSEN=()
+if [[ $MODE == yes ]]; then
+  for entry in "${SORTED[@]}"; do CHOSEN+=("${entry#*|}"); done
+else
+  command -v gum >/dev/null || {
+    err "gum not found — use --list then kill by hand, or --yes."
+    exit 1
+  }
+  mapfile -t CHOSEN < <(
+    printf '%s\n' "${SORTED[@]#*|}" |
+      gum choose --no-limit --header="Close what? (space to select, enter to confirm)"
+  )
+fi
+
+((${#CHOSEN[@]})) || {
+  info "Nothing selected, nothing closed."
+  exit 0
+}
+
+# --- closing -----------------------------------------------------------------
+KILLED=0
+PIDS_TO_KILL=()
+for line in "${CHOSEN[@]}"; do
+  [[ $line =~ \(pid\ ([0-9]+)\) ]] && PIDS_TO_KILL+=("${BASH_REMATCH[1]}")
+done
+
+for pid in "${PIDS_TO_KILL[@]}"; do
+  kill -TERM "$pid" 2>/dev/null && KILLED=$((KILLED + 1))
+done
+
+# Give applications time to close cleanly (some save their state on SIGTERM),
+# then insist on whatever is left.
+if ((KILLED)); then
+  sleep 3
+  for pid in "${PIDS_TO_KILL[@]}"; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  done
+  sleep 1
+fi
+
+# --- result ------------------------------------------------------------------
+read -r NEW_USED < <(
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1
+)
+FREED=$((USED - ${NEW_USED:-$USED}))
+((FREED < 0)) && FREED=0
+NEW_PCT=$((${NEW_USED:-$USED} * 100 / TOTAL))
+
+echo
+ok "${KILLED} application(s) closed — ${FREED} MiB freed."
+info "VRAM: ${NEW_USED:-?} / ${TOTAL} MiB (${NEW_PCT}%)"
+
+if command -v omarchy-notification-send >/dev/null; then
+  omarchy-notification-send "VRAM cleaned" \
+    "${FREED} MiB freed — ${NEW_USED:-?}/${TOTAL} MiB in use" 2>/dev/null || true
+fi

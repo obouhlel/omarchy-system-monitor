@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "id": "obouhlel.sysmon",
+  "name": "System monitor",
+  "version": "1.1.0",
+  "author": "obouhlel",
+  "license": "MIT",
+  "description": "CPU, RAM, GPU and VRAM usage in the bar, with a detail card on hover. Left click opens btop, right click drops RAM caches, middle click frees VRAM (NVIDIA).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "System monitor",
+    "description": "CPU, RAM, GPU and VRAM at a glance.",
+    "category": "System",
+    "aliases": [
+      "cpu",
+      "ram",
+      "gpu",
+      "vram",
+      "sysmon",
+      "monitor"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showGpu": true,
+      "warnThreshold": 75,
+      "refreshIntervalSec": 2
+    },
+    "schema": [
+      {
+        "key": "showGpu",
+        "type": "boolean",
+        "label": "Show GPU and VRAM",
+        "defaultValue": true,
+        "description": "Turn off on a machine with no NVIDIA or AMD GPU, or to shorten the widget."
+      },
+      {
+        "key": "warnThreshold",
+        "type": "integer",
+        "label": "Urgent threshold (%)",
+        "min": 50,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 75,
+        "description": "From this value a reading turns the urgent colour; 25 points below it, a halfway colour."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 2,
+        "description": "CPU and RAM tick. GPU polls at half this rate — nvidia-smi is far heavier than a /proc read."
+      }
+    ]
+  },
+  "homepage": "https://github.com/obouhlel/omarchy-system-monitor"
+}
